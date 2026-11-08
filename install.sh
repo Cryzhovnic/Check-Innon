@@ -49,7 +49,13 @@ fi
 # ---------- код ----------
 if [ -d "$DIR/.git" ]; then
     say "Обновляю код"
+    OLD_HEAD="$(git -C "$DIR" rev-parse HEAD)"
     git -C "$DIR" pull --ff-only -q
+    # если установщик сам обновился, запускаем его новую версию, а не доделываем старую
+    if [ "$OLD_HEAD" != "$(git -C "$DIR" rev-parse HEAD)" ] && [ -z "${INNON_REEXEC:-}" ]; then
+        say "Нашёл новую версию, продолжаю обновлённым установщиком"
+        INNON_REEXEC=1 exec bash "$DIR/install.sh" "$@"
+    fi
 else
     say "Скачиваю код в $DIR"
     [ -e "$DIR" ] && [ -n "$(ls -A "$DIR" 2>/dev/null)" ] && die "$DIR уже существует и не пустой."
@@ -59,16 +65,8 @@ chmod +x "$DIR/install.sh" "$DIR/manage.sh"
 
 # ---------- список тарифов ----------
 WATCHES_FILE="$DIR/watches.conf"
-if [ ! -f "$WATCHES_FILE" ]; then
-    say "Создаю список тарифов для слежения"
-    cat > "$WATCHES_FILE" <<'EOF'
-# URL|ТАРИФ - по строке на тариф. Управляй через меню: innon
-https://my.innon.org/epyc-9275f|LC-B1
-https://my.innon.org/ultra7-265|LC-A1
-EOF
-fi
-chown root:"$RUN_USER" "$WATCHES_FILE"
-chmod 640 "$WATCHES_FILE"
+# создаёт файл и дописывает недостающие тарифы LC-B1 и LC-A1 (логика лежит в manage.sh)
+( . "$DIR/manage.sh"; ensure_watches_file )
 
 # команда-меню
 ln -sf "$DIR/manage.sh" /usr/local/bin/innon

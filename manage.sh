@@ -51,15 +51,24 @@ plan_info() {
     esac
 }
 
+# два тарифа, за которыми следим
+DEFAULT_WATCHES=(
+    "https://my.innon.org/epyc-9275f|LC-B1"
+    "https://my.innon.org/ultra7-265|LC-A1"
+)
+
+# создаёт файл и дописывает недостающие тарифы (включёнными).
+# Уже существующие строки, в том числе выключенные |off, не трогает.
 ensure_watches_file() {
-    # создаём файл, если его нет или в нём нет ни одного тарифа
-    if [ ! -f "$WATCHES" ] || ! grep -qvE '^[[:space:]]*(#|$)' "$WATCHES"; then
-        cat > "$WATCHES" <<'EOF'
-# URL|ТАРИФ[|off] - по строке на тариф. Включай и выключай через меню: innon
-https://my.innon.org/epyc-9275f|LC-B1
-https://my.innon.org/ultra7-265|LC-A1
-EOF
+    if [ ! -f "$WATCHES" ]; then
+        printf '# URL|ТАРИФ[|off] - по строке на тариф. Включай и выключай через меню: innon\n' > "$WATCHES"
     fi
+    local d
+    for d in "${DEFAULT_WATCHES[@]}"; do
+        if ! grep -qxF -e "$d" -e "$d|on" -e "$d|off" "$WATCHES"; then
+            printf '%s\n' "$d" >> "$WATCHES"
+        fi
+    done
     chown root:"$RUN_USER" "$WATCHES" 2>/dev/null || true
     chmod 640 "$WATCHES"
 }
