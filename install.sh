@@ -76,14 +76,10 @@ ln -sf "$DIR/manage.sh" /usr/local/bin/innon
 # ---------- токены ----------
 ENV_FILE="$DIR/.env"
 
-ask_tty() {  # ask_tty "вопрос" [silent]
-    local prompt="$1" silent="${2:-}" val=""
+ask_tty() {  # ask_tty "вопрос"
+    local val=""
     [ -r /dev/tty ] || die "Нет терминала для вопросов. Передай TG_TOKEN и TG_CHAT_ID переменными окружения."
-    if [ "$silent" = "silent" ]; then
-        read -rsp "$prompt" val </dev/tty; echo >&2
-    else
-        read -rp "$prompt" val </dev/tty
-    fi
+    read -rp "$1" val </dev/tty
     printf '%s' "$val"
 }
 
@@ -98,7 +94,7 @@ else
     echo "Свой числовой ID можно узнать у @userinfobot."
     echo "Не забудь написать своему боту /start, иначе он не сможет писать тебе."
     echo
-    TOKEN="$(ask_tty 'TG_TOKEN (ввод скрыт): ' silent)"
+    TOKEN="$(ask_tty 'TG_TOKEN: ')"
     CHAT="$(ask_tty 'TG_CHAT_ID: ')"
     [ -n "$TOKEN" ] && [ -n "$CHAT" ] || die "Токен и ID не могут быть пустыми."
     printf 'TG_TOKEN=%s\nTG_CHAT_ID=%s\n' "$TOKEN" "$CHAT" > "$ENV_FILE"

@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
 Check-Innon: следит за тарифами на my.innon.org и шлёт сообщение в Telegram,
-когда тариф становится доступен для покупки.
+когда тариф становится доступен для покупки (одно сообщение, без повторов).
 
 Только стандартная библиотека Python 3.8+, ничего устанавливать не нужно.
 
 Список тарифов лежит в файле watches.conf рядом со скриптом, по строке на тариф:
     https://my.innon.org/epyc-9275f|LC-B1
-    https://my.innon.org/ultra7-265|LC-A1
-Строки с # и пустые игнорируются. Управлять списком удобнее через меню: innon
+    https://my.innon.org/ultra7-265|LC-A1|off      <- выключенный тариф
+Строки с # и пустые игнорируются. Включать и выключать тарифы удобнее через меню: innon
+Файл перечитывается на каждом круге, перезапуск после правки не нужен.
 
 Запуск:
     export TG_TOKEN="123456:ABC..."     # токен бота от @BotFather
     export TG_CHAT_ID="123456789"       # твой числовой Telegram ID
     python3 monitor.py                  # слежение
-    python3 monitor.py --list URL       # показать тарифы на странице
     python3 monitor.py --test-telegram  # отправить тестовое сообщение
 """
 
@@ -34,7 +34,6 @@ TG_TOKEN = os.environ.get("TG_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
 CHECK_EVERY = 10         # секунд между кругами проверки (плюс небольшой джиттер)
-REMIND_EVERY = 60        # пока тариф доступен - повторять уведомление раз в N секунд
 FAILS_BEFORE_ALERT = 10  # сколько ошибок подряд по странице до предупреждения
 EX_CONFIG = 78           # код выхода "нечего делать", systemd не перезапускает
 
@@ -106,6 +105,7 @@ def parse_cards(html: str) -> dict:
 # ---------------------------------------------------------------- список слежения
 
 def load_watches(path: str = None) -> list:
+    """Возвращает включённые тарифы [(url, plan), ...]. Строки с |off пропускаются."""
     path = path or WATCHES_FILE
     try:
         with open(path, encoding="utf-8") as f:
@@ -117,20 +117,23 @@ def load_watches(path: str = None) -> list:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        if "|" not in line:
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 2 or not parts[0] or not parts[1]:
             print(f"[!] {path}:{n}: ожидается URL|ТАРИФ, пропускаю: {line}", file=sys.stderr)
             continue
-        url, plan = (x.strip() for x in line.split("|", 1))
-        if url and plan and (url, plan) not in watches:
-            watches.append((url, plan))
+        if len(parts) >= 3 and parts[2].lower() == "off":
+            continue
+        item = (parts[0], parts[1])
+        if item not in watches:
+            watches.append(item)
     return watches
 
 
 # ---------------------------------------------------------------- проверка
 
 def handle_plan(url: str, plan: str, card, state: dict) -> None:
-    st = state.setdefault((url, plan),
-                          {"available": False, "last_alert": 0.0, "warned_missing": False})
+    """Одно уведомление при появлении тарифа. Повторов нет, пока он не пропадёт и не появится снова."""
+    st = state.setdefault((url, plan), {"notified": False, "warned_missing": False})
 
     if card is None or card[0] is None:
         if not st["warned_missing"]:
@@ -142,20 +145,19 @@ def handle_plan(url: str, plan: str, card, state: dict) -> None:
 
     st["warned_missing"] = False
     available, price = card
-    now = time.time()
 
     if available:
-        if not st["available"] or now - st["last_alert"] >= REMIND_EVERY:
+        if not st["notified"]:
             label = f"{plan} ({price})" if price else plan
+            # если отправка не удалась, повторим на следующем круге
             if tg_send(f"🔥 {label} ДОСТУПЕН!\nБеги покупать: {url}"):
-                st["last_alert"] = now
+                st["notified"] = True
                 print(f"[+] {plan}: доступен, уведомление отправлено", flush=True)
     else:
-        if st["available"]:
+        if st["notified"]:
             tg_send(f"{plan} снова раскупили.")
+        st["notified"] = False
         print(time.strftime("%H:%M:%S"), plan, "- нет в наличии", flush=True)
-
-    st["available"] = available
 
 
 def check_once(watches: list, state: dict, fails: dict, pause: float = 0.0) -> None:
@@ -180,23 +182,20 @@ def check_once(watches: list, state: dict, fails: dict, pause: float = 0.0) -> N
             handle_plan(url, plan, cards.get(plan), state)
 
 
+def sync_watches(prev: list, cur: list, state: dict) -> None:
+    """Сообщает о включённых/выключенных тарифах и сбрасывает состояние выключенных."""
+    for url, plan in cur:
+        if (url, plan) not in prev:
+            tg_send(f"Начал следить за {plan}.")
+            print(f"[i] включён {plan}", flush=True)
+    for item in prev:
+        if item not in cur:
+            tg_send(f"Перестал следить за {item[1]}.")
+            print(f"[i] выключен {item[1]}", flush=True)
+            state.pop(item, None)
+
+
 # ---------------------------------------------------------------- режимы запуска
-
-def cmd_list(url: str) -> int:
-    """Печатает тарифы страницы: название<TAB>цена<TAB>yes|no|unknown (для меню)."""
-    try:
-        cards = parse_cards(fetch(url))
-    except Exception as e:
-        print(f"Не удалось открыть страницу: {e}", file=sys.stderr)
-        return 1
-    if not cards:
-        print("На странице не найдено ни одного тарифа.", file=sys.stderr)
-        return 1
-    for name, (available, price) in cards.items():
-        status = {True: "yes", False: "no", None: "unknown"}[available]
-        print(f"{name}\t{price}\t{status}")
-    return 0
-
 
 def cmd_test_telegram() -> int:
     if not TG_TOKEN or not TG_CHAT_ID:
@@ -221,7 +220,7 @@ def main() -> None:
 
     watches = load_watches()
     if not watches:
-        fatal(f"Список тарифов пуст ({WATCHES_FILE}). Добавь тариф через меню: innon")
+        fatal(f"Нет включённых тарифов ({WATCHES_FILE}). Включи тариф через меню: innon")
 
     lines = "\n".join(f"• {plan} - {url}" for url, plan in watches)
     if not tg_send(f"Мониторинг запущен. Слежу за:\n{lines}"):
@@ -231,13 +230,20 @@ def main() -> None:
 
     state, fails = {}, {}
     while True:
-        check_once(watches, state, fails, pause=2.0)
+        try:
+            cur = load_watches()
+        except Exception as e:
+            print(f"[!] не прочитал список тарифов, оставляю прежний: {e}", file=sys.stderr)
+            cur = watches
+        if cur != watches:
+            sync_watches(watches, cur, state)
+            watches = cur
+        if watches:
+            check_once(watches, state, fails, pause=2.0)
         time.sleep(CHECK_EVERY + random.uniform(0, 3))
 
 
 if __name__ == "__main__":
-    if len(sys.argv) >= 3 and sys.argv[1] == "--list":
-        sys.exit(cmd_list(sys.argv[2]))
     if len(sys.argv) >= 2 and sys.argv[1] == "--test-telegram":
         sys.exit(cmd_test_telegram())
     main()
