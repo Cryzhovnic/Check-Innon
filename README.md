@@ -35,83 +35,63 @@ python3 monitor.py
 
 В Telegram придёт сообщение «Мониторинг LC-B1 запущен». Если оно не пришло, скрипт завершится с ошибкой.
 
-## Установка на свежий Debian 13
+## Установка на Debian 13 одной командой
 
-Команды выполняются от root.
-
-**1. Установи Python и сертификаты**
+Зайди на сервер по SSH под root и выполни:
 
 ```bash
-apt update
-apt install -y python3 ca-certificates git
+curl -fsSL https://raw.githubusercontent.com/Cryzhovnic/Check-Innon/main/install.sh | bash
 ```
 
-**2. Создай отдельного пользователя** без прав администратора
+Если `curl` не установлен: `apt update && apt install -y curl`.
+
+Установщик сам:
+1. ставит `python3`, `git`, `curl`, `ca-certificates`;
+2. создаёт системного пользователя `monitor` без прав входа;
+3. клонирует репозиторий в `/opt/innon-monitor`;
+4. спрашивает `TG_TOKEN` и `TG_CHAT_ID` и сохраняет их в `/opt/innon-monitor/.env` (права 640);
+5. проверяет токен запросом к Telegram;
+6. включает службу `innon-monitor` с автозапуском и перезапуском при падении.
+
+В конце в Telegram приходит сообщение «Мониторинг LC-B1 запущен».
+
+Токен и ID можно передать заранее, тогда вопросов не будет:
 
 ```bash
-useradd -r -m -d /opt/innon-monitor -s /usr/sbin/nologin monitor
+curl -fsSL https://raw.githubusercontent.com/Cryzhovnic/Check-Innon/main/install.sh -o install.sh
+TG_TOKEN="123456:ABC-твой-токен" TG_CHAT_ID="123456789" bash install.sh
 ```
 
-**3. Скачай скрипт**
+### Всё лежит в одном месте
+
+```
+/opt/innon-monitor/
+├── monitor.py
+├── innon-monitor.service   # подключается к systemd симлинком
+├── install.sh
+├── .env                    # токены, в git не попадает
+└── .git/
+```
+
+### Обновление
+
+Запусти ту же команду установки ещё раз. Код подтянется через `git pull`, существующий `.env` останется нетронутым, служба перезапустится.
+
+### Управление
 
 ```bash
-git clone https://github.com/Cryzhovnic/Check-Innon /tmp/check-innon
-cp /tmp/check-innon/monitor.py /opt/innon-monitor/monitor.py
-chown monitor:monitor /opt/innon-monitor/monitor.py
-rm -rf /tmp/check-innon
+systemctl status innon-monitor          # состояние
+journalctl -u innon-monitor -f          # живой лог
+systemctl restart innon-monitor         # перезапуск
 ```
 
-**4. Сохрани токены в отдельный файл**
+### Удаление
 
 ```bash
-cat > /etc/innon-monitor.env <<'EOF'
-TG_TOKEN=123456:ABC-твой-токен
-TG_CHAT_ID=123456789
-EOF
-chmod 600 /etc/innon-monitor.env
+curl -fsSL https://raw.githubusercontent.com/Cryzhovnic/Check-Innon/main/install.sh | bash -s -- --uninstall
 ```
 
-**5. Проверь вручную**
-
-```bash
-set -a; . /etc/innon-monitor.env; set +a
-python3 /opt/innon-monitor/monitor.py
-```
-
-В Telegram должно прийти стартовое сообщение, а в консоли будут строки «нет в наличии». Останови скрипт через Ctrl+C.
-
-**6. Запусти как службу**, чтобы скрипт работал постоянно и сам поднимался после перезагрузки
-
-```bash
-cat > /etc/systemd/system/innon-monitor.service <<'EOF'
-[Unit]
-Description=Innon LC-B1 stock monitor
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-User=monitor
-EnvironmentFile=/etc/innon-monitor.env
-ExecStart=/usr/bin/python3 -u /opt/innon-monitor/monitor.py
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now innon-monitor
-```
-
-**7. Управление**
-
-```bash
-systemctl status innon-monitor      # состояние
-journalctl -u innon-monitor -f      # живой лог
-systemctl restart innon-monitor     # перезапуск после правки скрипта
-systemctl disable --now innon-monitor   # остановить и убрать из автозапуска
-```
+Чтобы поменять токен или ID, отредактируй `/opt/innon-monitor/.env` и выполни `systemctl restart innon-monitor`.
 
 ## Настройки в скрипте
 
@@ -129,5 +109,5 @@ systemctl disable --now innon-monitor   # остановить и убрать �
 
 - Если сервер с мониторингом находится в России, Telegram может не открываться. Используй VPS в Европе или настрой прокси.
 - Слишком частые запросы (`CHECK_EVERY` меньше 5 секунд) могут привести к блокировке по IP.
-- Токен бота не храни в репозитории. В примерах выше он лежит в `/etc/innon-monitor.env` с правами `600`.
+- Токен бота не коммить в репозиторий: файл `.env` добавлен в `.gitignore`.
 - Разметка разобрана по сохранённым страницам. Если сайт отдаёт анонимным пользователям другую страницу, скрипт напишет «карточка не найдена».

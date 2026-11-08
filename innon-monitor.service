@@ -1,0 +1,18 @@
+[Unit]
+Description=Innon LC-B1 stock monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=monitor
+EnvironmentFile=/opt/innon-monitor/.env
+ExecStart=/usr/bin/python3 -u /opt/innon-monitor/monitor.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
