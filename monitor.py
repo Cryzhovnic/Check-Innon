@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """
-Следит за страницей https://my.innon.org/epyc-9275f и шлёт сообщение в Telegram,
-когда тариф LC-B1 становится доступен для покупки.
+Check-Innon: следит за тарифами на my.innon.org и шлёт сообщение в Telegram,
+когда тариф становится доступен для покупки.
 
 Только стандартная библиотека Python 3.8+, ничего устанавливать не нужно.
 
+Список тарифов лежит в файле watches.conf рядом со скриптом, по строке на тариф:
+    https://my.innon.org/epyc-9275f|LC-B1
+    https://my.innon.org/ultra7-265|LC-A1
+Строки с # и пустые игнорируются. Управлять списком удобнее через меню: innon
+
 Запуск:
     export TG_TOKEN="123456:ABC..."     # токен бота от @BotFather
-    export TG_CHAT_ID="123456789"       # твой chat_id
-    python3 monitor.py
+    export TG_CHAT_ID="123456789"       # твой числовой Telegram ID
+    python3 monitor.py                  # слежение
+    python3 monitor.py --list URL       # показать тарифы на странице
+    python3 monitor.py --test-telegram  # отправить тестовое сообщение
 """
 
-import json
 import os
 import random
 import re
@@ -20,15 +26,17 @@ import time
 import urllib.parse
 import urllib.request
 
-URL = "https://my.innon.org/epyc-9275f"
-PLAN = "LC-B1"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+WATCHES_FILE = os.environ.get("WATCHES_FILE", os.path.join(BASE_DIR, "watches.conf"))
+DEFAULT_WATCHES = [("https://my.innon.org/epyc-9275f", "LC-B1")]
 
 TG_TOKEN = os.environ.get("TG_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
-CHECK_EVERY = 10        # секунд между проверками (плюс небольшой джиттер)
-REMIND_EVERY = 60       # пока сервер доступен - повторять уведомление раз в N секунд
-FAILS_BEFORE_ALERT = 10 # сколько ошибок подряд до уведомления о проблеме
+CHECK_EVERY = 10         # секунд между кругами проверки (плюс небольшой джиттер)
+REMIND_EVERY = 60        # пока тариф доступен - повторять уведомление раз в N секунд
+FAILS_BEFORE_ALERT = 10  # сколько ошибок подряд по странице до предупреждения
+EX_CONFIG = 78           # код выхода "нечего делать", systemd не перезапускает
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -36,6 +44,11 @@ HEADERS = {
     "Accept-Language": "ru,en;q=0.8",
 }
 
+NAME_RE = re.compile(r"<h3[^>]*>\s*([^<]+?)\s*</h3>")
+PRICE_RE = re.compile(r"(\d[\d\s.,]*₽)")
+
+
+# ---------------------------------------------------------------- Telegram
 
 def tg_send(text: str) -> bool:
     """Отправляет сообщение, до 3 попыток. Возвращает True при успехе."""
@@ -56,79 +69,175 @@ def tg_send(text: str) -> bool:
     return False
 
 
-def fetch() -> str:
-    req = urllib.request.Request(URL, headers=HEADERS)
+# ---------------------------------------------------------------- страница
+
+def fetch(url: str) -> str:
+    req = urllib.request.Request(url, headers=HEADERS)
     with urllib.request.urlopen(req, timeout=15) as r:
         return r.read().decode("utf-8", errors="replace")
 
 
-def plan_status(html: str):
+def parse_cards(html: str) -> dict:
     """
-    Возвращает True (в наличии), False (нет в наличии) или None (карточка не найдена).
+    Возвращает {название_тарифа: (доступен, цена)}.
+    доступен: True / False / None (не удалось понять).
 
     Каждый тариф - блок с class="content-box ...". Внутри:
       недоступен -> <a ...>Нет в наличии</a>
       доступен   -> <button wire:click="addToCart">Добавить в корзину</button>
     """
-    chunks = html.split('class="content-box')
-    name_re = re.compile(r">\s*" + re.escape(PLAN) + r"\s*</h3>")
-    for chunk in chunks:
-        if not name_re.search(chunk):
+    cards = {}
+    for chunk in html.split('class="content-box')[1:]:
+        m = NAME_RE.search(chunk)
+        if not m:
             continue
         if "Нет в наличии" in chunk:
-            return False
-        if 'wire:click="addToCart"' in chunk or "Добавить в корзину" in chunk:
-            return True
-        return None
-    return None
+            available = False
+        elif 'wire:click="addToCart"' in chunk or "Добавить в корзину" in chunk:
+            available = True
+        else:
+            available = None
+        pm = PRICE_RE.search(chunk)
+        price = re.sub(r"\s+", " ", pm.group(1)).strip() if pm else ""
+        cards[m.group(1)] = (available, price)
+    return cards
+
+
+# ---------------------------------------------------------------- список слежения
+
+def load_watches(path: str = None) -> list:
+    path = path or WATCHES_FILE
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return list(DEFAULT_WATCHES)
+    watches = []
+    for n, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "|" not in line:
+            print(f"[!] {path}:{n}: ожидается URL|ТАРИФ, пропускаю: {line}", file=sys.stderr)
+            continue
+        url, plan = (x.strip() for x in line.split("|", 1))
+        if url and plan and (url, plan) not in watches:
+            watches.append((url, plan))
+    return watches
+
+
+# ---------------------------------------------------------------- проверка
+
+def handle_plan(url: str, plan: str, card, state: dict) -> None:
+    st = state.setdefault((url, plan),
+                          {"available": False, "last_alert": 0.0, "warned_missing": False})
+
+    if card is None or card[0] is None:
+        if not st["warned_missing"]:
+            tg_send(f"Не могу найти тариф {plan} на странице {url} - возможно, изменилась "
+                    f"вёрстка, тариф убрали или сайт отдал заглушку (антибот).")
+            st["warned_missing"] = True
+        print(f"[?] {plan}: карточка не найдена", flush=True)
+        return
+
+    st["warned_missing"] = False
+    available, price = card
+    now = time.time()
+
+    if available:
+        if not st["available"] or now - st["last_alert"] >= REMIND_EVERY:
+            label = f"{plan} ({price})" if price else plan
+            if tg_send(f"🔥 {label} ДОСТУПЕН!\nБеги покупать: {url}"):
+                st["last_alert"] = now
+                print(f"[+] {plan}: доступен, уведомление отправлено", flush=True)
+    else:
+        if st["available"]:
+            tg_send(f"{plan} снова раскупили.")
+        print(time.strftime("%H:%M:%S"), plan, "- нет в наличии", flush=True)
+
+    st["available"] = available
+
+
+def check_once(watches: list, state: dict, fails: dict, pause: float = 0.0) -> None:
+    """Один круг: каждая страница скачивается один раз, даже если на ней несколько тарифов."""
+    by_url = {}
+    for url, plan in watches:
+        by_url.setdefault(url, []).append(plan)
+
+    for i, (url, plans) in enumerate(by_url.items()):
+        if i and pause:
+            time.sleep(random.uniform(0.5, pause))
+        try:
+            cards = parse_cards(fetch(url))
+            fails[url] = 0
+        except Exception as e:
+            fails[url] = fails.get(url, 0) + 1
+            print(f"[!] {url}: ошибка запроса ({fails[url]}): {e}", file=sys.stderr, flush=True)
+            if fails[url] == FAILS_BEFORE_ALERT:
+                tg_send(f"Скрипт {FAILS_BEFORE_ALERT} раз подряд не может открыть {url}: {e}")
+            continue
+        for plan in plans:
+            handle_plan(url, plan, cards.get(plan), state)
+
+
+# ---------------------------------------------------------------- режимы запуска
+
+def cmd_list(url: str) -> int:
+    """Печатает тарифы страницы: название<TAB>цена<TAB>yes|no|unknown (для меню)."""
+    try:
+        cards = parse_cards(fetch(url))
+    except Exception as e:
+        print(f"Не удалось открыть страницу: {e}", file=sys.stderr)
+        return 1
+    if not cards:
+        print("На странице не найдено ни одного тарифа.", file=sys.stderr)
+        return 1
+    for name, (available, price) in cards.items():
+        status = {True: "yes", False: "no", None: "unknown"}[available]
+        print(f"{name}\t{price}\t{status}")
+    return 0
+
+
+def cmd_test_telegram() -> int:
+    if not TG_TOKEN or not TG_CHAT_ID:
+        print("Не заданы TG_TOKEN и TG_CHAT_ID", file=sys.stderr)
+        return 1
+    if tg_send("Тестовое сообщение от Check-Innon: всё работает."):
+        print("Сообщение отправлено.")
+        return 0
+    print("Не удалось отправить сообщение. Проверь токен, ID и что ты написал боту /start.",
+          file=sys.stderr)
+    return 1
+
+
+def fatal(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+    sys.exit(EX_CONFIG)
 
 
 def main() -> None:
     if not TG_TOKEN or not TG_CHAT_ID:
-        sys.exit("Задай переменные окружения TG_TOKEN и TG_CHAT_ID")
+        fatal("Задай переменные окружения TG_TOKEN и TG_CHAT_ID")
 
-    if not tg_send(f"Мониторинг {PLAN} запущен.\n{URL}"):
+    watches = load_watches()
+    if not watches:
+        fatal(f"Список тарифов пуст ({WATCHES_FILE}). Добавь тариф через меню: innon")
+
+    lines = "\n".join(f"• {plan} - {url}" for url, plan in watches)
+    if not tg_send(f"Мониторинг запущен. Слежу за:\n{lines}"):
         sys.exit("Не удалось отправить тестовое сообщение в Telegram. "
                  "Проверь TG_TOKEN и TG_CHAT_ID и что ты написал боту /start.")
-    print(f"Слежу за {PLAN}...", flush=True)
+    print("Слежу за:", ", ".join(plan for _, plan in watches), flush=True)
 
-    was_available = False
-    last_alert = 0.0
-    fails = 0
-    warned_missing = False
-
+    state, fails = {}, {}
     while True:
-        try:
-            status = plan_status(fetch())
-            fails = 0
-
-            if status is None:
-                if not warned_missing:
-                    tg_send(f"Не могу найти карточку {PLAN} на странице - возможно, "
-                            f"изменилась вёрстка или страница отдала заглушку (антибот).")
-                    warned_missing = True
-                print("[?] карточка не найдена")
-            else:
-                warned_missing = False
-                now = time.time()
-                if status and (not was_available or now - last_alert >= REMIND_EVERY):
-                    if tg_send(f"🔥 {PLAN} (EPYC 9275F, 399 ₽) ДОСТУПЕН!\nБеги покупать: {URL}"):
-                        last_alert = now
-                        print("[+] доступен, уведомление отправлено", flush=True)
-                elif not status:
-                    if was_available:
-                        tg_send(f"{PLAN} снова раскупили.")
-                    print(time.strftime("%H:%M:%S"), "нет в наличии")
-                was_available = status
-
-        except Exception as e:
-            fails += 1
-            print(f"[!] ошибка запроса ({fails}): {e}", file=sys.stderr)
-            if fails == FAILS_BEFORE_ALERT:
-                tg_send(f"Скрипт {FAILS_BEFORE_ALERT} раз подряд не может открыть страницу: {e}")
-
+        check_once(watches, state, fails, pause=2.0)
         time.sleep(CHECK_EVERY + random.uniform(0, 3))
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] == "--list":
+        sys.exit(cmd_list(sys.argv[2]))
+    if len(sys.argv) >= 2 and sys.argv[1] == "--test-telegram":
+        sys.exit(cmd_test_telegram())
     main()

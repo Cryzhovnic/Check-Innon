@@ -1,2 +1,3 @@
 .env
+watches.conf
 __pycache__/

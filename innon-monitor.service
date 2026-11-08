@@ -1,5 +1,5 @@
 [Unit]
-Description=Innon LC-B1 stock monitor
+Description=Check-Innon stock monitor
 After=network-online.target
 Wants=network-online.target
 
@@ -8,7 +8,8 @@ User=monitor
 EnvironmentFile=/opt/innon-monitor/.env
 ExecStart=/usr/bin/python3 -u /opt/innon-monitor/monitor.py
 Restart=always
-RestartSec=5
+RestartSec=10
+RestartPreventExitStatus=78
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

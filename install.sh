@@ -26,7 +26,7 @@ command -v systemctl >/dev/null || die "Нужен systemd."
 if [ "${1:-}" = "--uninstall" ]; then
     say "Удаляю службу и файлы"
     systemctl disable --now "$SERVICE" 2>/dev/null || true
-    rm -f "/etc/systemd/system/${SERVICE}.service"
+    rm -f "/etc/systemd/system/${SERVICE}.service" /usr/local/bin/innon
     systemctl daemon-reload
     rm -rf "$DIR"
     id "$RUN_USER" >/dev/null 2>&1 && userdel "$RUN_USER" || true
@@ -55,6 +55,23 @@ else
     [ -e "$DIR" ] && [ -n "$(ls -A "$DIR" 2>/dev/null)" ] && die "$DIR уже существует и не пустой."
     git clone -q "$REPO" "$DIR"
 fi
+chmod +x "$DIR/install.sh" "$DIR/manage.sh"
+
+# ---------- список тарифов ----------
+WATCHES_FILE="$DIR/watches.conf"
+if [ ! -f "$WATCHES_FILE" ]; then
+    say "Создаю список тарифов для слежения"
+    cat > "$WATCHES_FILE" <<'EOF'
+# URL|ТАРИФ - по строке на тариф. Управляй через меню: innon
+https://my.innon.org/epyc-9275f|LC-B1
+https://my.innon.org/ultra7-265|LC-A1
+EOF
+fi
+chown root:"$RUN_USER" "$WATCHES_FILE"
+chmod 640 "$WATCHES_FILE"
+
+# команда-меню
+ln -sf "$DIR/manage.sh" /usr/local/bin/innon
 
 # ---------- токены ----------
 ENV_FILE="$DIR/.env"
@@ -100,28 +117,36 @@ else
 fi
 
 # ---------- служба ----------
-say "Запускаю службу $SERVICE"
-systemctl enable "$DIR/${SERVICE}.service" >/dev/null 2>&1 || systemctl link "$DIR/${SERVICE}.service" >/dev/null
-systemctl daemon-reload
-systemctl enable "$SERVICE" >/dev/null 2>&1 || true
-systemctl restart "$SERVICE"
+FIRST_INSTALL=1
+systemctl cat "$SERVICE" >/dev/null 2>&1 && FIRST_INSTALL=0
+WAS_ENABLED=0
+systemctl is-enabled --quiet "$SERVICE" 2>/dev/null && WAS_ENABLED=1
 
-sleep 3
-if systemctl is-active --quiet "$SERVICE"; then
-    say "Работает. В Telegram должно прийти сообщение «Мониторинг LC-B1 запущен»."
+if [ "$FIRST_INSTALL" -eq 1 ]; then
+    systemctl enable "$DIR/${SERVICE}.service" >/dev/null 2>&1 || systemctl link "$DIR/${SERVICE}.service" >/dev/null
+fi
+systemctl daemon-reload
+
+if [ "$FIRST_INSTALL" -eq 1 ] || [ "$WAS_ENABLED" -eq 1 ]; then
+    say "Запускаю службу $SERVICE"
+    systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+    systemctl restart "$SERVICE"
+
+    sleep 3
+    if systemctl is-active --quiet "$SERVICE"; then
+        say "Работает. В Telegram должно прийти сообщение «Мониторинг запущен»."
+    else
+        warn "Служба не запустилась. Последние строки лога:"
+        journalctl -u "$SERVICE" -n 15 --no-pager || true
+        exit 1
+    fi
 else
-    warn "Служба не запустилась. Последние строки лога:"
-    journalctl -u "$SERVICE" -n 15 --no-pager || true
-    exit 1
+    say "Обновлено. Мониторинг был выключен, оставляю выключенным (включить: innon, пункт 2)."
 fi
 
 cat <<EOF
 
-Полезные команды:
-  systemctl status $SERVICE        состояние
-  journalctl -u $SERVICE -f        живой лог
-  systemctl restart $SERVICE       перезапуск
-  Обновить:  запусти установщик ещё раз
-  Удалить:   curl -fsSL https://raw.githubusercontent.com/Cryzhovnic/Check-Innon/main/install.sh | bash -s -- --uninstall
-Файлы: $DIR (токены в $ENV_FILE)
+Управление: введи  innon  - откроется меню (вкл/выкл, тарифы, токен, логи, удаление).
+Файлы: $DIR (токены в $ENV_FILE, список тарифов в $WATCHES_FILE)
+Обновить: запусти установщик ещё раз или пункт 10 в меню.
 EOF
