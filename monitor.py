@@ -4,7 +4,13 @@ Check-Innon: следит за тарифами на my.innon.org и шлёт с
 когда тариф становится доступен для покупки (одно сообщение, без повторов).
 
 Если написать боту любое сообщение, он ответит статусом: за чем следит,
-что сейчас в наличии, как давно проверял и сколько работает.
+что сейчас в наличии, как давно проверял, сколько работает и как быстро
+отвечают сайт и Telegram.
+
+Три независимых потока, чтобы медленный Telegram не тормозил проверку сайта:
+  - проверка: качает страницы и разбирает тарифы (основной поток);
+  - опрос: читает сообщения, адресованные боту, и готовит ответы;
+  - отправка: берёт сообщения из очереди и отправляет их с повторами.
 
 Только стандартная библиотека Python 3.8+, ничего устанавливать не нужно.
 
@@ -24,9 +30,11 @@ Check-Innon: следит за тарифами на my.innon.org и шлёт с
 
 import json
 import os
+import queue
 import random
 import re
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -51,6 +59,11 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
 CHECK_EVERY = 10         # секунд между кругами проверки (плюс небольшой джиттер)
 FAILS_BEFORE_ALERT = 10  # сколько ошибок подряд по странице до предупреждения
+SEND_TIMEOUT = 10        # таймаут одной попытки отправки, секунд
+SEND_ATTEMPTS = 10       # сколько раз пытаться отправить сообщение из очереди
+SEND_RETRY_PAUSE = 3     # пауза между попытками отправки, секунд
+POLL_WAIT = 25           # long polling getUpdates, секунд
+SLOW_WARN = 5.0          # ответ дольше этого (сек) пишем в лог как медленный
 EX_CONFIG = 78           # код выхода "нечего делать", systemd не перезапускает
 
 HEADERS = {
@@ -62,6 +75,18 @@ HEADERS = {
 NAME_RE = re.compile(r"<h3[^>]*>\s*([^<]+?)\s*</h3>")
 PRICE_RE = re.compile(r"(\d[\d\s.,]*₽)")
 
+STOP = threading.Event()
+OUTBOX: "queue.Queue[str]" = queue.Queue()
+
+# общее состояние, которое читает поток опроса для ответа статусом
+SHARED = {
+    "all_watches": [],      # [(url, plan, включён)]
+    "last_cycle": 0.0,      # когда закончился последний круг проверки
+    "cycle_secs": 0.0,      # сколько длился последний круг
+    "site_secs": {},        # url -> сколько секунд отвечал сайт
+    "tg_secs": None,        # сколько секунд занимала последняя отправка в Telegram
+}
+
 
 # ---------------------------------------------------------------- Telegram
 
@@ -72,17 +97,53 @@ def tg_api(method: str, params: dict, timeout: float) -> dict:
         return json.loads(r.read().decode("utf-8"))
 
 
+def tg_send_once(text: str) -> None:
+    """Одна попытка отправки. При ошибке бросает исключение."""
+    t0 = time.time()
+    tg_api("sendMessage",
+           {"chat_id": TG_CHAT_ID, "text": text, "disable_web_page_preview": "true"},
+           SEND_TIMEOUT)
+    secs = time.time() - t0
+    SHARED["tg_secs"] = secs
+    if secs > SLOW_WARN:
+        print(f"[!] Telegram отвечает медленно: {secs:.1f} с", file=sys.stderr, flush=True)
+
+
 def tg_send(text: str) -> bool:
-    """Отправляет сообщение, до 3 попыток. Возвращает True при успехе."""
-    params = {"chat_id": TG_CHAT_ID, "text": text, "disable_web_page_preview": "true"}
+    """Синхронная отправка, до 3 попыток (старт и тест). Возвращает True при успехе."""
     for attempt in range(3):
         try:
-            tg_api("sendMessage", params, 15)
+            tg_send_once(text)
             return True
         except Exception as e:
             print(f"[!] Telegram, попытка {attempt + 1}/3: {e}", file=sys.stderr)
             time.sleep(2)
     return False
+
+
+def notify(text: str) -> None:
+    """Ставит сообщение в очередь и сразу возвращается: проверка сайта не ждёт Telegram."""
+    OUTBOX.put(text)
+
+
+def sender_loop() -> None:
+    """Поток отправки: достаёт сообщения из очереди и отправляет с повторами."""
+    while not STOP.is_set():
+        try:
+            text = OUTBOX.get(timeout=1)
+        except queue.Empty:
+            continue
+        for attempt in range(1, SEND_ATTEMPTS + 1):
+            try:
+                tg_send_once(text)
+                break
+            except Exception as e:
+                print(f"[!] Telegram, попытка {attempt}/{SEND_ATTEMPTS}: {e}",
+                      file=sys.stderr, flush=True)
+                if STOP.wait(SEND_RETRY_PAUSE):
+                    return
+        else:
+            print(f"[!] Не удалось отправить, пропускаю: {text[:60]!r}", file=sys.stderr, flush=True)
 
 
 def skip_old_updates() -> int:
@@ -93,6 +154,34 @@ def skip_old_updates() -> int:
     except Exception as e:
         print(f"[!] getUpdates (старт): {e}", file=sys.stderr)
         return 0
+
+
+def poller_loop(make_status) -> None:
+    """
+    Поток опроса: слушает Telegram (long polling). Любое сообщение от владельца
+    (TG_CHAT_ID) получает в ответ статус. Чужие чаты игнорируются.
+    """
+    offset = skip_old_updates()
+    err_logged = False
+    while not STOP.is_set():
+        try:
+            res = tg_api("getUpdates",
+                         {"offset": offset, "timeout": POLL_WAIT, "allowed_updates": '["message"]'},
+                         POLL_WAIT + 10).get("result", [])
+            err_logged = False
+        except Exception as e:
+            if not err_logged:
+                print(f"[!] getUpdates: {e}", file=sys.stderr, flush=True)
+                err_logged = True
+            if STOP.wait(5):
+                return
+            continue
+        for upd in res:
+            offset = upd["update_id"] + 1
+            chat = (upd.get("message") or {}).get("chat") or {}
+            if str(chat.get("id")) == str(TG_CHAT_ID):
+                notify(make_status())
+                print("[i] запрошен статус", flush=True)
 
 
 # ---------------------------------------------------------------- страница
@@ -179,8 +268,8 @@ def handle_plan(url: str, plan: str, card, state: dict) -> None:
     if card is None or card[0] is None:
         st["seen"] = None
         if not st["warned_missing"]:
-            tg_send(f"Не могу найти тариф {plan} на странице {url} - возможно, изменилась "
-                    f"вёрстка, тариф убрали или сайт отдал заглушку (антибот).")
+            notify(f"Не могу найти тариф {plan} на странице {url} - возможно, изменилась "
+                   f"вёрстка, тариф убрали или сайт отдал заглушку (антибот).")
             st["warned_missing"] = True
         print(f"[?] {plan}: карточка не найдена", flush=True)
         return
@@ -192,18 +281,19 @@ def handle_plan(url: str, plan: str, card, state: dict) -> None:
     if available:
         if not st["notified"]:
             label = f"{plan} ({price})" if price else plan
-            # если отправка не удалась, повторим на следующем круге
-            if tg_send(f"🔥 {label} ДОСТУПЕН!\nБеги покупать: {url}"):
-                st["notified"] = True
-                print(f"[+] {plan}: доступен, уведомление отправлено", flush=True)
+            # сообщение уходит через очередь с повторами, поэтому помечаем сразу
+            notify(f"🔥 {label} ДОСТУПЕН!\nБеги покупать: {url}")
+            st["notified"] = True
+            print(f"[+] {plan}: доступен, уведомление поставлено в очередь", flush=True)
     else:
         if st["notified"]:
-            tg_send(f"{plan} снова раскупили.")
+            notify(f"{plan} снова раскупили.")
         st["notified"] = False
         print(time.strftime("%H:%M:%S"), plan, "- нет в наличии", flush=True)
 
 
-def check_once(watches: list, state: dict, fails: dict, pause: float = 0.0) -> None:
+def check_once(watches: list, state: dict, fails: dict, pause: float = 0.0,
+               timings: dict = None) -> None:
     """Один круг: каждая страница скачивается один раз, даже если на ней несколько тарифов."""
     by_url = {}
     for url, plan in watches:
@@ -212,6 +302,7 @@ def check_once(watches: list, state: dict, fails: dict, pause: float = 0.0) -> N
     for i, (url, plans) in enumerate(by_url.items()):
         if i and pause:
             time.sleep(random.uniform(0.5, pause))
+        t0 = time.time()
         try:
             cards = parse_cards(fetch(url))
             fails[url] = 0
@@ -219,8 +310,14 @@ def check_once(watches: list, state: dict, fails: dict, pause: float = 0.0) -> N
             fails[url] = fails.get(url, 0) + 1
             print(f"[!] {url}: ошибка запроса ({fails[url]}): {e}", file=sys.stderr, flush=True)
             if fails[url] == FAILS_BEFORE_ALERT:
-                tg_send(f"Скрипт {FAILS_BEFORE_ALERT} раз подряд не может открыть {url}: {e}")
+                notify(f"Скрипт {FAILS_BEFORE_ALERT} раз подряд не может открыть {url}: {e}")
             continue
+        finally:
+            secs = time.time() - t0
+            if timings is not None:
+                timings[url] = secs
+            if secs > SLOW_WARN:
+                print(f"[!] сайт отвечает медленно: {secs:.1f} с ({url})", file=sys.stderr, flush=True)
         for plan in plans:
             handle_plan(url, plan, cards.get(plan), state)
 
@@ -229,11 +326,11 @@ def sync_watches(prev: list, cur: list, state: dict) -> None:
     """Сообщает о включённых/выключенных тарифах и сбрасывает состояние выключенных."""
     for url, plan in cur:
         if (url, plan) not in prev:
-            tg_send(f"Начал следить за {plan}.")
+            notify(f"Начал следить за {plan}.")
             print(f"[i] включён {plan}", flush=True)
     for item in prev:
         if item not in cur:
-            tg_send(f"Перестал следить за {item[1]}.")
+            notify(f"Перестал следить за {item[1]}.")
             print(f"[i] выключен {item[1]}", flush=True)
             state.pop(item, None)
 
@@ -254,8 +351,9 @@ def fmt_duration(seconds: float) -> str:
     return f"{s}с"
 
 
-def build_status(all_watches: list, state: dict, fails: dict,
-                 started: float, last_cycle: float, now: float = None) -> str:
+def build_status(all_watches: list, state: dict, fails: dict, started: float,
+                 last_cycle: float, now: float = None, site_secs: dict = None,
+                 tg_secs: float = None, cycle_secs: float = None) -> str:
     now = now or time.time()
     on = enabled_only(all_watches)
     off = [plan for _, plan, enabled in all_watches if not enabled]
@@ -267,6 +365,16 @@ def build_status(all_watches: list, state: dict, fails: dict,
                      f"(проверяю каждые ~{CHECK_EVERY} с)")
     else:
         lines.append("Первая проверка ещё идёт")
+
+    speed = []
+    if site_secs:
+        speed.append(f"сайт отвечает за {max(site_secs.values()):.1f} с")
+    if cycle_secs:
+        speed.append(f"круг проверки {cycle_secs:.1f} с")
+    if tg_secs is not None:
+        speed.append(f"Telegram: отправка за {tg_secs:.1f} с")
+    if speed:
+        lines.append("Скорость: " + ", ".join(speed))
     lines.append("")
 
     if on:
@@ -294,35 +402,33 @@ def build_status(all_watches: list, state: dict, fails: dict,
     return "\n".join(lines)
 
 
-def wait_and_answer(deadline: float, offset: int, make_status) -> int:
-    """
-    Вместо обычной паузы слушает Telegram (long polling) до deadline.
-    Любое сообщение от владельца (TG_CHAT_ID) получает в ответ статус.
-    Сообщения от других чатов игнорируются. Возвращает новый offset.
-    """
-    err_logged = False
-    while True:
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            return offset
-        wait = max(1, int(min(remaining, 25)))
+# ---------------------------------------------------------------- цикл проверки
+
+def checker_loop(state: dict, fails: dict, started: float, pause: float = 2.0) -> None:
+    """Основной поток. Не зависит от скорости Telegram: сообщения лишь ставятся в очередь."""
+    watches = enabled_only(SHARED["all_watches"])
+    while not STOP.is_set():
+        t0 = time.time()
         try:
-            res = tg_api("getUpdates",
-                         {"offset": offset, "timeout": wait, "allowed_updates": '["message"]'},
-                         wait + 10).get("result", [])
-            err_logged = False
+            all_watches = load_all_watches()
+            cur = enabled_only(all_watches)
         except Exception as e:
-            if not err_logged:
-                print(f"[!] getUpdates: {e}", file=sys.stderr, flush=True)
-                err_logged = True
-            time.sleep(max(0.0, min(remaining, 5)))
-            continue
-        for upd in res:
-            offset = upd["update_id"] + 1
-            chat = (upd.get("message") or {}).get("chat") or {}
-            if str(chat.get("id")) == str(TG_CHAT_ID):
-                tg_send(make_status())
-                print("[i] отправил статус по запросу", flush=True)
+            print(f"[!] не прочитал список тарифов, оставляю прежний: {e}", file=sys.stderr)
+            all_watches, cur = SHARED["all_watches"], watches
+        SHARED["all_watches"] = all_watches
+        if cur != watches:
+            sync_watches(watches, cur, state)
+            watches = cur
+
+        timings = {}
+        if watches:
+            check_once(watches, state, fails, pause=pause, timings=timings)
+        SHARED["site_secs"] = timings
+        SHARED["cycle_secs"] = time.time() - t0
+        SHARED["last_cycle"] = time.time()
+
+        if STOP.wait(CHECK_EVERY + random.uniform(0, 3)):
+            return
 
 
 # ---------------------------------------------------------------- режимы запуска
@@ -332,7 +438,7 @@ def cmd_test_telegram() -> int:
         print("Не заданы TG_TOKEN и TG_CHAT_ID", file=sys.stderr)
         return 1
     if tg_send(f"Тестовое сообщение от Check-Innon v{VERSION}: всё работает."):
-        print("Сообщение отправлено.")
+        print(f"Сообщение отправлено за {SHARED['tg_secs']:.1f} с.")
         return 0
     print("Не удалось отправить сообщение. Проверь токен, ID и что ты написал боту /start.",
           file=sys.stderr)
@@ -352,6 +458,7 @@ def main() -> None:
     watches = enabled_only(all_watches)
     if not watches:
         fatal(f"Нет включённых тарифов ({WATCHES_FILE}). Включи тариф через меню: innon")
+    SHARED["all_watches"] = all_watches
 
     lines = "\n".join(f"• {plan} - {url}" for url, plan in watches)
     if not tg_send(f"Мониторинг запущен (v{VERSION}). Слежу за:\n{lines}\n\n"
@@ -361,28 +468,16 @@ def main() -> None:
     print(f"Check-Innon v{VERSION}. Слежу за:", ", ".join(plan for _, plan in watches), flush=True)
 
     started = time.time()
-    last_cycle = 0.0
     state, fails = {}, {}
-    offset = skip_old_updates()
 
-    while True:
-        try:
-            all_watches = load_all_watches()
-            cur = enabled_only(all_watches)
-        except Exception as e:
-            print(f"[!] не прочитал список тарифов, оставляю прежний: {e}", file=sys.stderr)
-            cur = watches
-        if cur != watches:
-            sync_watches(watches, cur, state)
-            watches = cur
-        if watches:
-            check_once(watches, state, fails, pause=2.0)
-        last_cycle = time.time()
+    def make_status() -> str:
+        return build_status(SHARED["all_watches"], state, fails, started, SHARED["last_cycle"],
+                            site_secs=SHARED["site_secs"], tg_secs=SHARED["tg_secs"],
+                            cycle_secs=SHARED["cycle_secs"])
 
-        deadline = last_cycle + CHECK_EVERY + random.uniform(0, 3)
-        offset = wait_and_answer(
-            deadline, offset,
-            lambda: build_status(all_watches, state, fails, started, last_cycle))
+    threading.Thread(target=sender_loop, name="sender", daemon=True).start()
+    threading.Thread(target=poller_loop, args=(make_status,), name="poller", daemon=True).start()
+    checker_loop(state, fails, started)
 
 
 if __name__ == "__main__":
