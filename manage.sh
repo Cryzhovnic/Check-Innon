@@ -2,7 +2,7 @@
 # Меню управления Check-Innon. Запуск: innon
 #
 # Команды без меню:
-#   innon status | on N | off N | token | test | logs | update | uninstall
+#   innon version | status | on N | off N | token | test | logs | update | uninstall
 # N - номер тарифа из меню (1, 2, ...)
 
 set -uo pipefail
@@ -35,6 +35,13 @@ load_entries() {
 entry_url()  { printf '%s' "${1%%|*}"; }
 entry_plan() { local r="${1#*|}"; printf '%s' "${r%%|*}"; }
 entry_on()   { [[ "$1" != *"|off" ]]; }
+
+version_string() {
+    local v="?" h=""
+    [ -f "$DIR/VERSION" ] && v="$(tr -d '[:space:]' < "$DIR/VERSION")"
+    h="$(git -C "$DIR" rev-parse --short HEAD 2>/dev/null || true)"
+    printf 'v%s%s' "$v" "${h:+ ($h)}"
+}
 
 plan_info() {
     case "$1" in
@@ -153,6 +160,7 @@ cmd_set() {  # cmd_set N on|off|toggle
 cmd_status() {
     local act="выключен"
     service_active && act="РАБОТАЕТ"
+    echo "Check-Innon $(version_string)"
     echo "Мониторинг: $act"
     echo "Тарифы:"
     print_entries
@@ -261,7 +269,7 @@ menu() {
         n="${#ENTRIES[@]}"
         local act="выключен"
         service_active && act="РАБОТАЕТ"
-        printf '\n\033[1mCheck-Innon\033[0m   мониторинг: %s\n' "$act"
+        printf '\n\033[1mCheck-Innon %s\033[0m   мониторинг: %s\n' "$(version_string)" "$act"
         echo "Тарифы (номер - включить/выключить слежение):"
         print_entries
         echo "Другое:"
@@ -305,6 +313,7 @@ main() {
     ensure_watches_file
     case "${1:-}" in
         "")        menu ;;
+        version|-V|--version) version_string; echo ;;
         status)    cmd_status ;;
         on)        cmd_set "${2:-}" on ;;
         off)       cmd_set "${2:-}" off ;;
