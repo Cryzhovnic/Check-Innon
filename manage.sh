@@ -14,6 +14,7 @@ ENV_FILE="$DIR/.env"
 WATCHES="$DIR/watches.conf"
 PY="/usr/bin/python3"
 INSTALL_URL="https://raw.githubusercontent.com/Cryzhovnic/Check-Innon/main/install.sh"
+IN_MENU=0
 
 say()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*" >&2; }
@@ -107,8 +108,7 @@ enabled_count() {
     echo "$n"
 }
 
-print_entries() {
-    load_entries
+print_entries() {  # печатает ENTRIES, их нужно загрузить заранее через load_entries
     if [ "${#ENTRIES[@]}" -eq 0 ]; then
         echo "  (список тарифов пуст)"
         return
@@ -128,6 +128,7 @@ print_entries() {
 
 service_active()  { systemctl is-active --quiet "$SERVICE"; }
 service_enabled() { systemctl is-enabled --quiet "$SERVICE" 2>/dev/null; }
+service_label()   { if service_active; then echo "РАБОТАЕТ"; else echo "выключен"; fi; }
 
 sync_service() {
     local n
@@ -166,19 +167,22 @@ cmd_set() {  # cmd_set N on|off|toggle
     sync_service
 }
 
-cmd_status() {
-    local act="выключен"
-    service_active && act="РАБОТАЕТ"
+cmd_status() {  # для `innon status` без меню
     echo "Check-Innon $(version_string)"
-    echo "Мониторинг: $act"
+    echo "Мониторинг: $(service_label)"
     echo "Тарифы:"
+    load_entries
     print_entries
     echo
-    echo "Последние строки лога:"
-    journalctl -u "$SERVICE" -n 8 --no-pager 2>/dev/null || true
+    journalctl -u "$SERVICE" -n 5 --no-pager 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------- Telegram
+
+# отправляет тестовое сообщение с переданными данными (код 0 - Telegram принял)
+telegram_ok() {  # telegram_ok TOKEN CHAT_ID
+    TG_TOKEN="$1" TG_CHAT_ID="$2" "$PY" -I "$DIR/monitor.py" --test-telegram
+}
 
 cmd_token() {
     local token chat cur_chat="" old_token=""
@@ -198,6 +202,13 @@ cmd_token() {
         warn "Токен и ID не могут быть пустыми."
         return
     fi
+
+    # сначала проверяем, чтобы опечатка не сломала работающего бота
+    echo "Проверяю: отправляю тестовое сообщение..."
+    if ! telegram_ok "$token" "$chat"; then
+        warn "Не сохранил: Telegram не принял эти данные. Проверь токен, ID и что ты написал боту /start."
+        return
+    fi
     printf 'TG_TOKEN=%s\nTG_CHAT_ID=%s\n' "$token" "$chat" > "$ENV_FILE"
     chown root:"$RUN_USER" "$ENV_FILE" 2>/dev/null || true
     chmod 640 "$ENV_FILE"
@@ -207,7 +218,7 @@ cmd_token() {
     fi
 }
 
-cmd_test() {
+cmd_test() {  # для `innon test` без меню
     if [ ! -f "$ENV_FILE" ]; then
         warn "Нет файла $ENV_FILE"
         return
@@ -227,15 +238,29 @@ cmd_logs() {
 }
 
 cmd_update() {
+    local before after
+    before="$(version_string)"
     if [ -f "$DIR/install.sh" ]; then
-        bash "$DIR/install.sh"
+        bash "$DIR/install.sh" || { warn "Обновление завершилось с ошибкой."; return 1; }
     else
-        curl -fsSL "$INSTALL_URL" | bash
+        curl -fsSL "$INSTALL_URL" | bash || { warn "Обновление завершилось с ошибкой."; return 1; }
+    fi
+    after="$(version_string)"
+    if [ "$before" = "$after" ]; then
+        say "Уже последняя версия: $after"
+    else
+        say "Обновлено: $before -> $after"
+    fi
+    # меню уже загружено в память старым, поэтому после обновления открываем его заново
+    if [ "$IN_MENU" = "1" ]; then
+        say "Открываю обновлённое меню"
+        sleep 1
+        exec "$DIR/manage.sh"
     fi
 }
 
 cmd_uninstall() {
-    cat <<EOF
+    cat <<TEXT
 
 Будет удалено ВСЁ:
   - служба $SERVICE (остановка и автозапуск)
@@ -244,7 +269,7 @@ cmd_uninstall() {
   - команда innon (и это меню)
 Пакеты python3, git и curl останутся.
 
-EOF
+TEXT
     local ans
     read -rp "Введи yes для удаления (Enter или 0 - отмена): " ans
     if [ "$ans" != "yes" ]; then
@@ -259,52 +284,58 @@ EOF
 
 # ---------------------------------------------------------------- меню
 
-pause() { read -rp "Enter - вернуться в меню " _ || true; }
+# читает выбор в CHOICE: одна клавиша без Enter, если пунктов не больше 9
+read_choice() {  # read_choice ВСЕГО_ПУНКТОВ
+    CHOICE=""
+    if [ "$1" -le 9 ]; then
+        read -rn1 CHOICE || return 1
+        # если нажали цифру и Enter, лишний перевод строки не должен попасть в следующий вопрос
+        if [ -t 0 ]; then read -rt 0.05 -n 100 _ 2>/dev/null || true; fi
+        echo
+    else
+        read -r CHOICE || return 1
+    fi
+}
 
 menu() {
-    local choice n i e
-    # другие пункты после списка тарифов: "функция|подпись|нужна ли пауза"
+    IN_MENU=1
+    local n total i e
+    # пункты после списка тарифов: "функция|подпись"
     local actions=(
-        "cmd_status|Статус и последние строки лога|1"
-        "cmd_token|Сменить токен бота / ID получателя|1"
-        "cmd_test|Отправить тестовое сообщение в Telegram|1"
-        "cmd_logs|Показать логи|0"
-        "cmd_update|Обновить из GitHub|1"
-        "cmd_uninstall|Удалить всё (бот, служба, скрипты)|1"
+        "cmd_logs|Логи"
+        "cmd_token|Токен бота и ID получателя"
+        "cmd_update|Обновить из GitHub"
+        "cmd_uninstall|Удалить всё (бот, служба, скрипты)"
     )
     trap ':' INT
     while true; do
         load_entries
         n="${#ENTRIES[@]}"
-        local act="выключен"
-        service_active && act="РАБОТАЕТ"
-        printf '\n\033[1mCheck-Innon %s\033[0m   мониторинг: %s\n' "$(version_string)" "$act"
-        echo "Тарифы (номер - включить/выключить слежение):"
+        total=$((n + ${#actions[@]}))
+        printf '\n\033[1mCheck-Innon %s\033[0m   мониторинг: %s\n' "$(version_string)" "$(service_label)"
+        echo "Тарифы (номер - включить/выключить):"
         print_entries
         echo "Другое:"
         i=0
         for e in "${actions[@]}"; do
             i=$((i + 1))
-            IFS='|' read -r _ label _ <<< "$e"
-            printf '  %d) %s\n' "$((n + i))" "$label"
+            printf '  %d) %s\n' "$((n + i))" "${e#*|}"
         done
         echo "  0) Выход"
-        read -rp "> " choice || { echo; break; }
-        echo
-        case "$choice" in
+        printf 'Выбор: '
+        read_choice "$total" || { echo; break; }
+        case "$CHOICE" in
             0|q|Q) break ;;
             "") continue ;;
         esac
-        if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
+        if ! [[ "$CHOICE" =~ ^[0-9]+$ ]]; then
             warn "Нет такого пункта"
             continue
         fi
-        if [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then
-            cmd_set "$choice" toggle
-        elif [ "$choice" -gt "$n" ] && [ "$choice" -le "$((n + ${#actions[@]}))" ]; then
-            IFS='|' read -r fn _ wait <<< "${actions[$((choice - n - 1))]}"
-            "$fn"
-            [ "$wait" = "1" ] && pause
+        if [ "$CHOICE" -ge 1 ] && [ "$CHOICE" -le "$n" ]; then
+            cmd_set "$CHOICE" toggle
+        elif [ "$CHOICE" -gt "$n" ] && [ "$CHOICE" -le "$total" ]; then
+            "${actions[$((CHOICE - n - 1))]%%|*}"
         else
             warn "Нет такого пункта"
         fi

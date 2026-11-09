@@ -356,7 +356,6 @@ def build_status(all_watches: list, state: dict, fails: dict, started: float,
                  tg_secs: float = None, cycle_secs: float = None) -> str:
     now = now or time.time()
     on = enabled_only(all_watches)
-    off = [plan for _, plan, enabled in all_watches if not enabled]
 
     lines = [f"✅ Check-Innon v{VERSION} работает",
              f"Аптайм: {fmt_duration(now - started)}"]
@@ -396,9 +395,6 @@ def build_status(all_watches: list, state: dict, fails: dict, started: float,
     else:
         lines.append("Сейчас ни один тариф не включён.")
 
-    if off:
-        lines.append("")
-        lines.append("Выключены: " + ", ".join(off))
     return "\n".join(lines)
 
 
