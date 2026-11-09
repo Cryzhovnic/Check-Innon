@@ -82,8 +82,6 @@ OUTBOX: "queue.Queue[str]" = queue.Queue()
 SHARED = {
     "all_watches": [],      # [(url, plan, включён)]
     "last_cycle": 0.0,      # когда закончился последний круг проверки
-    "cycle_secs": 0.0,      # сколько длился последний круг
-    "site_secs": {},        # url -> сколько секунд отвечал сайт
     "tg_secs": None,        # сколько секунд занимала последняя отправка в Telegram
 }
 
@@ -352,8 +350,7 @@ def fmt_duration(seconds: float) -> str:
 
 
 def build_status(all_watches: list, state: dict, fails: dict, started: float,
-                 last_cycle: float, now: float = None, site_secs: dict = None,
-                 tg_secs: float = None, cycle_secs: float = None) -> str:
+                 last_cycle: float, now: float = None) -> str:
     now = now or time.time()
     on = enabled_only(all_watches)
 
@@ -364,16 +361,6 @@ def build_status(all_watches: list, state: dict, fails: dict, started: float,
                      f"(проверяю каждые ~{CHECK_EVERY} с)")
     else:
         lines.append("Первая проверка ещё идёт")
-
-    speed = []
-    if site_secs:
-        speed.append(f"сайт отвечает за {max(site_secs.values()):.1f} с")
-    if cycle_secs:
-        speed.append(f"круг проверки {cycle_secs:.1f} с")
-    if tg_secs is not None:
-        speed.append(f"Telegram: отправка за {tg_secs:.1f} с")
-    if speed:
-        lines.append("Скорость: " + ", ".join(speed))
     lines.append("")
 
     if on:
@@ -419,8 +406,6 @@ def checker_loop(state: dict, fails: dict, started: float, pause: float = 2.0) -
         timings = {}
         if watches:
             check_once(watches, state, fails, pause=pause, timings=timings)
-        SHARED["site_secs"] = timings
-        SHARED["cycle_secs"] = time.time() - t0
         SHARED["last_cycle"] = time.time()
 
         if STOP.wait(CHECK_EVERY + random.uniform(0, 3)):
@@ -467,9 +452,7 @@ def main() -> None:
     state, fails = {}, {}
 
     def make_status() -> str:
-        return build_status(SHARED["all_watches"], state, fails, started, SHARED["last_cycle"],
-                            site_secs=SHARED["site_secs"], tg_secs=SHARED["tg_secs"],
-                            cycle_secs=SHARED["cycle_secs"])
+        return build_status(SHARED["all_watches"], state, fails, started, SHARED["last_cycle"])
 
     threading.Thread(target=sender_loop, name="sender", daemon=True).start()
     threading.Thread(target=poller_loop, args=(make_status,), name="poller", daemon=True).start()
