@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 # Меню управления Check-Innon. Запуск: innon
 #
-# Команды без меню:
-#   innon version | status | on N | off N | token | test | logs | update | uninstall
-# N - номер тарифа из меню (1, 2, ...)
+# Команды без меню: innon help
 
 set -uo pipefail
 
@@ -149,6 +147,57 @@ sync_service() {
     fi
 }
 
+cmd_start() {  # innon start
+    if [ "$(enabled_count)" -eq 0 ]; then
+        warn "Нет включённых тарифов. Включи тариф: innon on 1"
+        return 1
+    fi
+    systemctl enable --now "$SERVICE" >/dev/null 2>&1
+    sleep 2
+    if service_active; then say "Мониторинг запущен."; else warn "Не запустился, смотри: innon logs"; return 1; fi
+}
+
+cmd_stop() {  # innon stop
+    systemctl disable --now "$SERVICE" >/dev/null 2>&1
+    say "Мониторинг остановлен (и не запустится после перезагрузки). Включить: innon start"
+}
+
+cmd_restart() {  # innon restart
+    if [ "$(enabled_count)" -eq 0 ]; then
+        warn "Нет включённых тарифов. Включи тариф: innon on 1"
+        return 1
+    fi
+    systemctl enable "$SERVICE" >/dev/null 2>&1
+    systemctl restart "$SERVICE"
+    sleep 2
+    if service_active; then say "Мониторинг перезапущен."; else warn "Не запустился, смотри: innon logs"; return 1; fi
+}
+
+cmd_logs_follow() {  # innon logs: последние строки и живой вывод, как pm2 logs
+    echo "(Ctrl+C - выйти из лога)"
+    journalctl -u "$SERVICE" -n 50 -f || true
+}
+
+cmd_help() {
+    cat <<TEXT
+Check-Innon $(version_string)
+
+  innon                меню
+  innon status         состояние, тарифы и последние строки лога
+  innon start          запустить мониторинг
+  innon stop           остановить (и убрать из автозапуска)
+  innon restart        перезапустить
+  innon logs           лог в реальном времени (Ctrl+C - выход)
+  innon on 1|2         включить тариф (номера из меню)
+  innon off 1|2        выключить тариф
+  innon token          сменить токен бота / ID получателя
+  innon test           тестовое сообщение в Telegram
+  innon update         обновить из GitHub
+  innon version        версия
+  innon uninstall      удалить всё
+TEXT
+}
+
 cmd_set() {  # cmd_set N on|off|toggle
     local n="$1" mode="$2"
     load_entries
@@ -284,19 +333,6 @@ TEXT
 
 # ---------------------------------------------------------------- меню
 
-# читает выбор в CHOICE: одна клавиша без Enter, если пунктов не больше 9
-read_choice() {  # read_choice ВСЕГО_ПУНКТОВ
-    CHOICE=""
-    if [ "$1" -le 9 ]; then
-        read -rn1 CHOICE || return 1
-        # если нажали цифру и Enter, лишний перевод строки не должен попасть в следующий вопрос
-        if [ -t 0 ]; then read -rt 0.05 -n 100 _ 2>/dev/null || true; fi
-        echo
-    else
-        read -r CHOICE || return 1
-    fi
-}
-
 menu() {
     IN_MENU=1
     local n total i e
@@ -322,8 +358,8 @@ menu() {
             printf '  %d) %s\n' "$((n + i))" "${e#*|}"
         done
         echo "  0) Выход"
-        printf 'Выбор: '
-        read_choice "$total" || { echo; break; }
+        printf 'Номер + Enter: '
+        read -r CHOICE || { echo; break; }
         case "$CHOICE" in
             0|q|Q) break ;;
             "") continue ;;
@@ -355,14 +391,18 @@ main() {
         "")        menu ;;
         version|-V|--version) version_string; echo ;;
         status)    cmd_status ;;
+        start)     cmd_start ;;
+        stop)      cmd_stop ;;
+        restart)   cmd_restart ;;
+        help|-h|--help) cmd_help ;;
         on)        cmd_set "${2:-}" on ;;
         off)       cmd_set "${2:-}" off ;;
         token)     cmd_token ;;
         test)      cmd_test ;;
-        logs)      cmd_logs ;;
+        logs)      cmd_logs_follow ;;
         update)    cmd_update ;;
         uninstall) cmd_uninstall ;;
-        *) echo "Неизвестная команда: $1" >&2; exit 1 ;;
+        *) echo "Неизвестная команда: $1" >&2; cmd_help >&2; exit 1 ;;
     esac
 }
 
